@@ -36,7 +36,8 @@ ACTION tedp::setecondev(uint64_t amount)
     setpayout(name("econdevfunds"), amount, daily_interval);
 }
 
-ACTION tedp::setrex(uint64_t amount) {
+ACTION tedp::setrex(uint64_t amount)
+{
     check(amount <= max_rex_amount, "Max amount for eosio.rex account is 685 per 30min");
     setpayout(name("eosio.rex"), amount, rex_interval);
 }
@@ -99,9 +100,13 @@ ACTION tedp::pay()
 
         if (p.to == name("eosio.rex"))
         {
+            total_payout = do_rexbuy(total_payout);
             // channel_to_rex
-            eosio::print("Channeling to rex\n");
-            action(permission_level{_self, name("active")}, name("eosio"), name("distviarex"), make_tuple(get_self(), total_payout)).send();
+            if (total_payout.amount > 0)
+            {
+                eosio::print("Channeling to rex\n");
+                action(permission_level{_self, name("active")}, name("eosio"), name("distviarex"), make_tuple(get_self(), total_payout)).send();
+            }
         }
         else
         {
@@ -112,4 +117,194 @@ ACTION tedp::pay()
     }
 
     check(payouts_made, "No payouts are due");
+}
+
+ACTION tedp::setrexbuy(name account_name, uint64_t buy_time, uint64_t interval, asset cpu_amount, asset net_amount)
+{
+    auto rexbuy = rexbuys.find(account_name.value);
+    check(rexbuy == rexbuys.end(), "rexbuy already exists for account");
+    rexbuys.emplace(get_self(), [&](auto &b) {
+        b.receiver = account_name;
+        b.in_progress = false;
+        b.interval = interval;
+        b.buy_time = buy_time;
+        b.net_amount = net_amount;
+        b.cpu_amount = cpu_amount;
+    });
+}
+
+ACTION tedp::cancelrexbuy(name account_name)
+{
+    auto rexbuy = rexbuys.find(account_name.value);
+    check(rexbuy != rexbuys.end(), "rexbuy already exists for account");
+    rexbuys.erase(rexbuy);
+}
+
+asset tedp::do_rexbuy(asset total_payout)
+{
+    uint64_t now_sec = current_time_point().sec_since_epoch();
+    auto buytime_index = rexbuys.get_index<"buytime"_n>();
+
+    // first pass, handle in progress payments
+    for (auto itr = buytime_index.begin(); itr != buytime_index.end(); itr++)
+    {
+        if (total_payout.amount <= 0)
+            break;
+
+        auto buy = *itr;
+
+        if (!buy.in_progress || buy.buy_time > now_sec)
+            continue;
+
+        asset total_due = buy.net_left + buy.cpu_left;
+        if (total_due <= total_payout)
+        {
+            total_payout -= total_due;
+
+            buytime_index.modify(itr, get_self(), [&](auto &b) {
+                b.in_progress = false;
+                b.buy_time = buy.buy_time + buy.interval;
+                b.net_left = asset(0, symbol("TLOS", 4));
+                b.cpu_left = asset(0, symbol("TLOS", 4));
+            });
+
+            // double check in case any math has caused a overflow
+            check(total_due <= total_payout, "Trying to buy more rex than total_payout");
+            rexdeposit(total_due);
+            rexnet(buy.net_left, buy.receiver);
+            rexcpu(buy.cpu_left, buy.receiver);
+        }
+        else
+        {
+            total_payout -= total_due;
+
+            asset due_split = total_due / 2;
+            asset to_cpu = due_split;
+            asset to_net = due_split;
+
+            if (buy.net_left < due_split)
+            {
+                to_net = buy.net_left;
+                to_cpu += (due_split - buy.net_left);
+            }
+            else if (buy.cpu_left < due_split)
+            {
+                to_cpu = buy.cpu_left;
+                to_net += (due_split - buy.cpu_left);
+            }
+
+            buytime_index.modify(itr, get_self(), [&](auto &b) {
+                b.net_left -= to_net;
+                b.cpu_left -= to_cpu;
+            });
+
+            // double check in case any math has caused a overflow
+            check(total_due <= total_payout, "Trying to buy more rex than total_payout");
+            rexdeposit(total_due);
+            rexnet(buy.net_left, buy.receiver);
+            rexcpu(buy.cpu_left, buy.receiver);
+        }
+    }
+
+    // second pass, handle new payments
+    for (auto itr = buytime_index.begin(); itr != buytime_index.end(); itr++)
+    {
+        if (total_payout.amount <= 0)
+            break;
+
+        auto buy = *itr;
+        if (buy.in_progress || buy.buy_time > now_sec)
+            continue;
+
+        asset total_due = buy.net_left + buy.cpu_left;
+        if (total_due <= total_payout)
+        {
+            total_payout -= total_due;
+
+            buytime_index.modify(itr, get_self(), [&](auto &b) {
+                b.buy_time = buy.buy_time + buy.interval;
+                b.net_left = asset(0, symbol("TLOS", 4));
+                b.cpu_left = asset(0, symbol("TLOS", 4));
+            });
+
+            // double check in case any math has caused a overflow
+            check(total_due <= total_payout, "Trying to buy more rex than total_payout");
+            rexdeposit(total_due);
+            rexnet(buy.net_left, buy.receiver);
+            rexcpu(buy.cpu_left, buy.receiver);
+        }
+        else
+        {
+            total_payout -= total_due;
+
+            asset due_split = total_due / 2;
+            asset to_cpu = due_split;
+            asset to_net = due_split;
+
+            if (buy.net_left < due_split)
+            {
+                to_net = buy.net_left;
+                to_cpu += (due_split - buy.net_left);
+            }
+            else if (buy.cpu_left < due_split)
+            {
+                to_cpu = buy.cpu_left;
+                to_net += (due_split - buy.cpu_left);
+            }
+
+            buytime_index.modify(itr, get_self(), [&](auto &b) {
+                b.in_progress = true;
+                b.net_left -= to_net;
+                b.cpu_left -= to_cpu;
+            });
+
+            // double check in case any math has caused a overflow
+            check(total_due <= total_payout, "Trying to buy more rex than total_payout");
+            rexdeposit(total_due);
+            rexnet(buy.net_left, buy.receiver);
+            rexcpu(buy.cpu_left, buy.receiver);
+        }
+    }
+
+    return total_payout;
+}
+
+void tedp::rexdeposit(asset deposit_amount)
+{
+    action(
+        permission_level{_self, name("active")},
+        name("eosio"),
+        name("deposit"),
+        make_tuple(
+            get_self(),
+            deposit_amount))
+        .send();
+}
+
+void tedp::rexnet(asset net_amount, name for_account)
+{
+    action(
+        permission_level{_self, name("active")},
+        name("eosio"),
+        name("rentnet"),
+        make_tuple(
+            get_self(),
+            for_account,
+            net_amount,
+            asset(0, symbol("TLOS", 4))))
+        .send();
+}
+
+void tedp::rexcpu(asset cpu_amount, name for_account)
+{
+    action(
+        permission_level{_self, name("active")},
+        name("eosio"),
+        name("rentcpu"),
+        make_tuple(
+            get_self(),
+            for_account,
+            cpu_amount,
+            asset(0, symbol("TLOS", 4))))
+        .send();
 }
